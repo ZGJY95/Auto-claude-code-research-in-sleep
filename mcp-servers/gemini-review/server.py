@@ -46,6 +46,7 @@ DEFAULT_TIMEOUT_SEC = int(os.environ.get("GEMINI_REVIEW_TIMEOUT_SEC", "600"))
 DEFAULT_API_MODEL = os.environ.get("GEMINI_REVIEW_API_MODEL", "gemini-2.5-flash")
 DEFAULT_AGY_PRINT_TIMEOUT = os.environ.get("GEMINI_REVIEW_AGY_PRINT_TIMEOUT", f"{DEFAULT_TIMEOUT_SEC}s")
 MAX_STATUS_WAIT_SECONDS = int(os.environ.get("GEMINI_REVIEW_MAX_STATUS_WAIT_SECONDS", "30"))
+MAX_CONTENT_LENGTH = int(os.environ.get("GEMINI_REVIEW_MAX_CONTENT_LENGTH", str(50 * 1024 * 1024)))
 AGY_APP_DATA_DIR = Path(
     os.environ.get(
         "GEMINI_REVIEW_AGY_APP_DATA_DIR",
@@ -179,6 +180,8 @@ def read_message() -> dict[str, Any] | None:
         try:
             content_length = int(line_text.split(":", 1)[1].strip())
         except ValueError:
+            return None
+        if content_length < 0 or content_length > MAX_CONTENT_LENGTH:
             return None
 
         while True:
@@ -381,26 +384,36 @@ def gemini_api_model_path(model_name: str) -> str:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_private_dir(path.parent)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(temp_path, flags, 0o600)
     try:
-        os.chmod(temp_path, 0o600)
-    except OSError:
-        pass
-    temp_path.replace(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        temp_path.replace(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_private_env_file(env_file: Path | None = None) -> list[str]:
+def load_private_env_file(env_file: Path | None = None) -> dict[str, str]:
     target = env_file or (Path.home() / ".gemini" / ".env")
     lines = read_private_env_lines(target)
     if lines is None:
-        return []
+        return {}
 
-    loaded: list[str] = []
+    loaded: dict[str, str] = {}
     for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -416,9 +429,7 @@ def load_private_env_file(env_file: Path | None = None) -> list[str]:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
-        if key not in os.environ:
-            os.environ[key] = value
-            loaded.append(key)
+        loaded[key] = value
     return loaded
 
 
@@ -508,17 +519,23 @@ def find_agy_bin() -> str | None:
     return shutil.which(AGY_BIN)
 
 
-def resolve_backend(preferred_backend: str | None) -> str:
+def resolve_backend(preferred_backend: str | None, private_env: dict[str, str] | None = None) -> str:
     backend = preferred_backend or DEFAULT_BACKEND
     if backend not in {"auto", "api", "cli", "agy"}:
         raise ValueError(f"unsupported Gemini backend: {backend}")
     if backend == "auto":
-        return "api" if get_api_key() else "cli"
+        return "api" if get_api_key(private_env) else "cli"
     return backend
 
 
-def get_api_key() -> str | None:
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+def get_api_key(private_env: dict[str, str] | None = None) -> str | None:
+    private_env = private_env or {}
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or private_env.get("GEMINI_API_KEY")
+        or private_env.get("GOOGLE_API_KEY")
+    )
 
 
 def parse_gemini_json(raw_stdout: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -616,6 +633,7 @@ def agy_artifact_text(
     *,
     conversation_root: Path,
     artifact_min_mtime: float | None = None,
+    artifact_max_mtime: float | None = None,
 ) -> str | None:
     if path.suffix.lower() not in {".md", ".markdown", ".txt", ".json", ".yaml", ".yml"}:
         return None
@@ -623,8 +641,12 @@ def agy_artifact_text(
     if result is None:
         return None
     text, file_stat = result
-    if artifact_min_mtime is not None and file_stat.st_mtime < artifact_min_mtime - 1.0:
-        return None
+    if artifact_min_mtime is not None:
+        if file_stat.st_mtime < artifact_min_mtime - 1.0 or file_stat.st_ctime < artifact_min_mtime - 1.0:
+            return None
+    if artifact_max_mtime is not None:
+        if file_stat.st_mtime > artifact_max_mtime + 1.0 or file_stat.st_ctime > artifact_max_mtime + 1.0:
+            return None
     text = text.strip()
     if not text:
         return None
@@ -682,15 +704,10 @@ def collect_model_candidates_from_agy_log(text: str, candidates: list[str]) -> N
 
 def transcript_step_is_user_event(step: dict[str, Any]) -> bool:
     source = str(step.get("source", "")).upper()
-    role = str(step.get("role", "")).lower()
     step_type = str(step.get("type", "")).upper()
-    author = str(step.get("author", "")).lower()
-    return (
-        source in {"USER", "USER_EXPLICIT", "USER_IMPLICIT"}
-        or role == "user"
-        or author == "user"
-        or step_type in {"USER_INPUT", "USER_MESSAGE"}
-    )
+    if source in {"USER", "USER_EXPLICIT"}:
+        return not step_type or step_type in {"USER_INPUT", "USER_MESSAGE"}
+    return False
 
 
 def transcript_step_contains_nonce(step: dict[str, Any], invocation_nonce: str) -> bool:
@@ -794,6 +811,7 @@ def extract_agy_response_from_transcript(
     *,
     invocation_nonce: str | None = None,
     artifact_min_mtime: float | None = None,
+    artifact_max_mtime: float | None = None,
 ) -> str | None:
     if not invocation_nonce:
         return None
@@ -830,6 +848,7 @@ def extract_agy_response_from_transcript(
                     path,
                     conversation_root=conversation_root,
                     artifact_min_mtime=artifact_min_mtime,
+                    artifact_max_mtime=artifact_max_mtime,
                 )
                 if artifact:
                     return artifact
@@ -842,6 +861,7 @@ def extract_agy_response_from_state(
     *,
     invocation_nonce: str | None = None,
     artifact_min_mtime: float | None = None,
+    artifact_max_mtime: float | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     if not invocation_nonce:
         return None, "invocation_nonce is required for Antigravity transcript recovery", None
@@ -855,6 +875,7 @@ def extract_agy_response_from_state(
         conversation_id,
         invocation_nonce=invocation_nonce,
         artifact_min_mtime=artifact_min_mtime,
+        artifact_max_mtime=artifact_max_mtime,
     )
     if response:
         debug_log(f"AGY_TRANSCRIPT_RECOVERED conversation={conversation_id}")
@@ -1191,6 +1212,7 @@ def run_agy_cli_review(
                 cmd,
                 timeout_sec=DEFAULT_TIMEOUT_SEC + 15,
             )
+            invocation_finished_at = time.time()
         except (OSError, ValueError) as exc:
             return None, f"failed to launch Antigravity CLI: {exc}"
         if process_error:
@@ -1208,6 +1230,7 @@ def run_agy_cli_review(
                 agy_log_path,
                 invocation_nonce=invocation_nonce,
                 artifact_min_mtime=invocation_started_at,
+                artifact_max_mtime=invocation_finished_at,
             )
             if recovered_text:
                 response_text = recovered_text
@@ -1220,6 +1243,7 @@ def run_agy_cli_review(
                 agy_log_path,
                 invocation_nonce=invocation_nonce,
                 artifact_min_mtime=invocation_started_at,
+                artifact_max_mtime=invocation_finished_at,
             )
             if recovered_text:
                 response_text = recovered_text
@@ -1276,8 +1300,9 @@ def run_gemini_api_review(
     model: str | None,
     system: str | None,
     image_paths: list[str],
+    private_env: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    api_key = get_api_key()
+    api_key = get_api_key(private_env)
     if not api_key:
         return None, "Gemini API backend requires GEMINI_API_KEY or GOOGLE_API_KEY"
 
@@ -1376,7 +1401,7 @@ def run_gemini_review(
 ) -> tuple[dict[str, Any] | None, str | None]:
     del tools
 
-    load_private_env_file()
+    private_env = load_private_env_file()
 
     normalized_image_paths, image_error = normalize_image_paths(image_paths)
     if image_error:
@@ -1390,7 +1415,7 @@ def run_gemini_review(
         thread_id = uuid.uuid4().hex
     history = load_thread_history(thread_id) if session_id else []
     try:
-        selected_backend = resolve_backend(backend)
+        selected_backend = resolve_backend(backend, private_env)
     except ValueError as exc:
         return None, str(exc)
 
@@ -1401,6 +1426,7 @@ def run_gemini_review(
             model=model,
             system=system,
             image_paths=normalized_image_paths,
+            private_env=private_env,
         )
     elif selected_backend == "agy":
         payload, error = run_agy_cli_review(
