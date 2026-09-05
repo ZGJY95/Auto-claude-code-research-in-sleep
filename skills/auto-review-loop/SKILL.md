@@ -25,7 +25,7 @@ Autonomously iterate: review → implement fixes → re-review, until an indepen
 - MAX_ROUNDS = 4
 - POSITIVE_THRESHOLD: score >= 6/10 **AND** verdict ∈ {"ready", "almost"} — **both** must hold. This matches the operative Phase-E STOP CONDITION exactly; the verdict vocabulary is {"ready", "almost", "not ready"} (a high score with a "not ready" verdict does NOT stop the loop). Earlier wording here used `or` and a stale verdict set ("accept"/"sufficient"/"ready for submission") — that was an internal inconsistency; the `AND` form is authoritative.
 - REVIEW_DOC: `review-stage/AUTO_REVIEW.md` (cumulative log) *(fall back to `./AUTO_REVIEW.md` for legacy projects)*
-- REVIEWER_MODEL = `gpt-5.6-sol` — Default model for the Codex backend. Must be an OpenAI model (e.g., `gpt-5.6-sol`, `o3`, `gpt-4o`). Manual backend uses whatever model the user chooses.
+- REVIEWER_MODEL = `gpt-5.6-sol` — Default model for the Codex backend. Must be an OpenAI model (e.g., `gpt-5.6-sol`, `o3`, `gpt-4o`). Manual backend uses a model the user chooses — it must be a recognized model from a different family (OpenAI, Anthropic, Google, DeepSeek, Moonshot/Kimi, Qwen).
 - **REVIEWER_BACKEND** — With no reviewer directive, start as `auto`; Step -1 runs exactly one two-call native marker/challenge probe for the first review. A bound Copilot CLI root session uses `copilot-native` (built-in complementary `rubber-duck` subagent); an unbound/non-Copilot host keeps the existing `codex` default. Explicit `— reviewer: codex`, `oracle-pro`, `agy`, or `manual` bypasses the probe and selects that external backend. Explicit `— reviewer: copilot` retains the compatibility `copilot --agent` drive mode and its later Codex/manual finalizer. The native path gets both actual model IDs from host session events; it never needs `COPILOT_CLI` or caller-provided `--executor-model`. See `shared-references/reviewer-routing.md`.
 - **OUTPUT_DIR = `review-stage/`** — All review-stage outputs go here. Create the directory if it doesn't exist.
 - **HUMAN_CHECKPOINT = false** — When `true`, pause after each round's review (Phase B) and present the score + weaknesses to the user. Wait for user input before proceeding to Phase C. The user can: approve the suggested fixes, provide custom modification instructions, skip specific fixes, or stop the loop early. When `false` (default), the loop runs fully autonomously.
@@ -387,6 +387,30 @@ mcp__codex__codex:
 
     Be brutally honest. If, after genuinely trying to break it, the work holds
     up and is ready, say so clearly.
+
+    === SCOPE LIMITS (these bound what you PROPOSE, never what you look for) ===
+    Report anything that is actually wrong here — including a rare-looking case, if
+    this repo actually produces it. Then keep the fix in scope:
+    1. This is a RESEARCH-WORKFLOW tool, not a security paper. Verification is
+       welcome; over-defense is not. Assume a cooperating operator on their own
+       machine — a malicious local user is NOT in the threat model.
+    2. Do NOT propose SHA / hash / content-fingerprint / digest-binding schemes.
+       Reporting a real defect in hashing code that already exists is fine.
+    3. NO speculative machinery: do not add feature flags, migration frameworks,
+       compat layers, wrappers, pins, or similar mechanisms unless evidence shows
+       a current repo defect they fix or an explicit existing invariant they must
+       preserve. "Load-bearing", "compatibility", and "not scaffolding" are labels,
+       not evidence. Point to the failing path/artifact or invariant, and check the
+       proposal's factual premises, such as whether a named package version exists.
+    4. NO corner-case obsession: exotic encodings, symlink races, RTL text and
+       millisecond races are out of scope unless you can show the case arises here.
+    5. Where a rubric or checklist is genuinely needed, do not over-mechanize
+       judgement. A clear sentence a human reads beats a scored table nobody
+       maintains.
+    Exception: code that runs remote commands, starts a network service, or installs
+    an MCP server runs on the user's machine with their credentials — trust-boundary
+    findings there are in scope and the default is strict.
+    Say plainly when something is correct. Do not manufacture findings.
 ```
 
 *For manual backend:* use `mcp__manual_review__review` with the `prompt` text above and `config: {"model_reasoning_effort": "xhigh", "executor_model": "<actual executor model>", "require_reviewer_model": true}`. Save the returned `threadId`.
@@ -428,6 +452,30 @@ mcp__codex__codex:
        or patterns you want to track in future rounds.
 
     Be brutally honest. Actively look for things the author might be hiding.
+
+    === SCOPE LIMITS (these bound what you PROPOSE, never what you look for) ===
+    Report anything that is actually wrong here — including a rare-looking case, if
+    this repo actually produces it. Then keep the fix in scope:
+    1. This is a RESEARCH-WORKFLOW tool, not a security paper. Verification is
+       welcome; over-defense is not. Assume a cooperating operator on their own
+       machine — a malicious local user is NOT in the threat model.
+    2. Do NOT propose SHA / hash / content-fingerprint / digest-binding schemes.
+       Reporting a real defect in hashing code that already exists is fine.
+    3. NO speculative machinery: do not add feature flags, migration frameworks,
+       compat layers, wrappers, pins, or similar mechanisms unless evidence shows
+       a current repo defect they fix or an explicit existing invariant they must
+       preserve. "Load-bearing", "compatibility", and "not scaffolding" are labels,
+       not evidence. Point to the failing path/artifact or invariant, and check the
+       proposal's factual premises, such as whether a named package version exists.
+    4. NO corner-case obsession: exotic encodings, symlink races, RTL text and
+       millisecond races are out of scope unless you can show the case arises here.
+    5. Where a rubric or checklist is genuinely needed, do not over-mechanize
+       judgement. A clear sentence a human reads beats a scored table nobody
+       maintains.
+    Exception: code that runs remote commands, starts a network service, or installs
+    an MCP server runs on the user's machine with their credentials — trust-boundary
+    findings there are in scope and the default is strict.
+    Say plainly when something is correct. Do not manufacture findings.
 ```
 
 ##### Nightmare — Codex Exec (GPT reads repo directly)
@@ -463,6 +511,30 @@ OUTPUT FORMAT:
 - Memory update: [new suspicions and patterns to track next round]
 
 Be adversarial. Trust nothing the author tells you — verify everything yourself.
+
+=== SCOPE LIMITS (these bound what you PROPOSE, never what you look for) ===
+Report anything that is actually wrong here — including a rare-looking case, if
+this repo actually produces it. Then keep the fix in scope:
+1. This is a RESEARCH-WORKFLOW tool, not a security paper. Verification is
+   welcome; over-defense is not. Assume a cooperating operator on their own
+   machine — a malicious local user is NOT in the threat model.
+2. Do NOT propose SHA / hash / content-fingerprint / digest-binding schemes.
+   Reporting a real defect in hashing code that already exists is fine.
+3. NO speculative machinery: do not add feature flags, migration frameworks,
+   compat layers, wrappers, pins, or similar mechanisms unless evidence shows
+   a current repo defect they fix or an explicit existing invariant they must
+   preserve. "Load-bearing", "compatibility", and "not scaffolding" are labels,
+   not evidence. Point to the failing path/artifact or invariant, and check the
+   proposal's factual premises, such as whether a named package version exists.
+4. NO corner-case obsession: exotic encodings, symlink races, RTL text and
+   millisecond races are out of scope unless you can show the case arises here.
+5. Where a rubric or checklist is genuinely needed, do not over-mechanize
+   judgement. A clear sentence a human reads beats a scored table nobody
+   maintains.
+Exception: code that runs remote commands, starts a network service, or installs
+an MCP server runs on the user's machine with their credentials — trust-boundary
+findings there are in scope and the default is strict.
+Say plainly when something is correct. Do not manufacture findings.
 PROMPT
 )" --skip-git-repo-check 2>&1
 ```
@@ -955,6 +1027,30 @@ cat <<'ARIS_ROUND_INSTRUCTIONS'
 Please re-score and re-assess. Are the remaining concerns addressed?
 Same format: Score, Verdict, Remaining Weaknesses, Minimum Fixes.
 
+=== SCOPE LIMITS (these bound what you PROPOSE, never what you look for) ===
+Report anything that is actually wrong here — including a rare-looking case, if
+this repo actually produces it. Then keep the fix in scope:
+1. This is a RESEARCH-WORKFLOW tool, not a security paper. Verification is
+   welcome; over-defense is not. Assume a cooperating operator on their own
+   machine — a malicious local user is NOT in the threat model.
+2. Do NOT propose SHA / hash / content-fingerprint / digest-binding schemes.
+   Reporting a real defect in hashing code that already exists is fine.
+3. NO speculative machinery: do not add feature flags, migration frameworks,
+   compat layers, wrappers, pins, or similar mechanisms unless evidence shows
+   a current repo defect they fix or an explicit existing invariant they must
+   preserve. "Load-bearing", "compatibility", and "not scaffolding" are labels,
+   not evidence. Point to the failing path/artifact or invariant, and check the
+   proposal's factual premises, such as whether a named package version exists.
+4. NO corner-case obsession: exotic encodings, symlink races, RTL text and
+   millisecond races are out of scope unless you can show the case arises here.
+5. Where a rubric or checklist is genuinely needed, do not over-mechanize
+   judgement. A clear sentence a human reads beats a scored table nobody
+   maintains.
+Exception: code that runs remote commands, starts a network service, or installs
+an MCP server runs on the user's machine with their credentials — trust-boundary
+findings there are in scope and the default is strict.
+Say plainly when something is correct. Do not manufacture findings.
+
 At the end of your review, include a Memory Update section — this will
 be passed back to you next round.
 ARIS_ROUND_INSTRUCTIONS
@@ -977,6 +1073,30 @@ copilot --agent "$REVIEWER_PROFILE" --model "$REVIEWER_MODEL" \
 
     Please re-score and re-assess. Are the remaining concerns addressed?
     Same format: Score, Verdict, Remaining Weaknesses, Minimum Fixes.
+
+    === SCOPE LIMITS (these bound what you PROPOSE, never what you look for) ===
+    Report anything that is actually wrong here — including a rare-looking case, if
+    this repo actually produces it. Then keep the fix in scope:
+    1. This is a RESEARCH-WORKFLOW tool, not a security paper. Verification is
+       welcome; over-defense is not. Assume a cooperating operator on their own
+       machine — a malicious local user is NOT in the threat model.
+    2. Do NOT propose SHA / hash / content-fingerprint / digest-binding schemes.
+       Reporting a real defect in hashing code that already exists is fine.
+    3. NO speculative machinery: do not add feature flags, migration frameworks,
+       compat layers, wrappers, pins, or similar mechanisms unless evidence shows
+       a current repo defect they fix or an explicit existing invariant they must
+       preserve. "Load-bearing", "compatibility", and "not scaffolding" are labels,
+       not evidence. Point to the failing path/artifact or invariant, and check the
+       proposal's factual premises, such as whether a named package version exists.
+    4. NO corner-case obsession: exotic encodings, symlink races, RTL text and
+       millisecond races are out of scope unless you can show the case arises here.
+    5. Where a rubric or checklist is genuinely needed, do not over-mechanize
+       judgement. A clear sentence a human reads beats a scored table nobody
+       maintains.
+    Exception: code that runs remote commands, starts a network service, or installs
+    an MCP server runs on the user's machine with their credentials — trust-boundary
+    findings there are in scope and the default is strict.
+    Say plainly when something is correct. Do not manufacture findings.
 ```
 
 ## Review Tracing

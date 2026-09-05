@@ -55,6 +55,125 @@ Resolve the reviewer pair on the **first new Codex session of each tier** in a r
 - If no allowed pair succeeds, emit `REVIEW_UNAVAILABLE` (or, for a mandatory audit gate, `ERROR`) — never a substantive verdict.
 - This automatic chain applies only when no explicit reviewer-model override was supplied.
 
+### Optional HTTP API fallback for Codex pre-dispatch failures
+
+Claude Code + ARIS Skills may use the existing `llm-chat` MCP as an **opt-in
+transport fallback** when the Codex reviewer cannot be started safely. This does
+not replace the Codex capability chain above and it is disabled by default.
+The user must explicitly configure the `llm-chat` server with
+`LLM_REVIEW_FALLBACK_ENABLED=true`; only then does it expose
+`mcp__llm-chat__review` and `mcp__llm-chat__review_reply`. The legacy
+`mcp__llm-chat__chat` tool by itself is **not** a verdict-bearing fallback.
+This transport fallback applies to Codex **MCP** review calls; Codex-exec
+nightmare-mode behavior is unchanged.
+
+#### Safe switch boundary
+
+The fallback is intentionally **pre-dispatch-only**, matching ARIS-Code's
+reviewer fallback safety rule:
+
+- First apply the Codex model/effort capability fallback above.
+- HTTP fallback MAY run when the Codex path is known not to have produced a
+  review: the Codex MCP tool is absent/unregistered, the local MCP process
+  cannot spawn or initialize, or an error explicitly proves the reviewer
+  request was rejected before model execution.
+- HTTP fallback MUST NOT run merely because a dispatched Codex call timed out,
+  disconnected, returned an ambiguous transport/server/parse failure, or
+  otherwise might have executed without returning a usable thread. Keep the
+  existing `REVIEW_UNAVAILABLE` / `ERROR` behavior in those cases; silently
+  issuing a second paid review risks double-running and conflicting verdicts.
+- The existing `NEVER downgrade on ...` list above remains authoritative. An
+  error from that list may activate HTTP fallback only when the error itself
+  positively establishes that no model request was dispatched.
+
+This boundary is deliberately narrower than "Codex returned any error." Users
+who explicitly want a different reviewer regardless of Codex state should pick
+that backend directly (`oracle-pro`, `agy`, or `manual`) instead of relying on
+fallback.
+
+#### HTTP fallback call contract
+
+For a fresh fallback review, use:
+
+```
+mcp__llm-chat__review:
+  prompt: [same substantive review task Codex would receive]
+  executor_model: <actual executor model id>
+  files:
+    - <primary artifact path 1>
+    - <primary artifact path 2>
+```
+
+Do **not** pass Codex-only fields such as `config.model_reasoning_effort`,
+`sandbox`, `approval-policy`, `cwd`, `threadId`, base/developer instructions, or
+other Codex transport parameters. `llm-chat` reads each explicit `files:` entry
+locally and sends the primary artifact contents verbatim to the configured HTTP
+endpoint; this is necessary because a remote OpenAI-compatible API cannot read
+local Linux paths. Pass primary artifacts, not executor-written summaries, per
+`reviewer-independence.md`.
+
+For every follow-up after the HTTP fallback owns the reviewer thread — including
+round 2+ and a hard-mode rebuttal ruling in the same round — use:
+
+```
+mcp__llm-chat__review_reply:
+  threadId: <saved llm-chat threadId>
+  prompt: [follow-up review task]
+  files:
+    - <changed/current primary artifacts the reviewer must inspect>
+```
+
+`review_reply` carries the prior user/reviewer exchanges in the MCP server, so
+multi-round skills do not silently lose continuity when the fallback activates.
+
+For `/auto-review-loop`, a safe HTTP fallback means the HTTP reviewer is the
+backend that actually ran the current round. **Before the HTTP call**, replace
+the current-round snapshot as well as the forward-looking backend:
+
+```
+REVIEWER_BACKEND=llm-chat
+round_backend=llm-chat
+round_requires_external_acquittal=false
+```
+
+Then pass the returned `reviewer_model` (not merely the requested alias) to
+`review_gate.py --round-backend llm-chat`. The fallback is not a Copilot
+compatibility finalizer and must not inherit a stale external-acquittal
+obligation from some unrelated round.
+
+The HTTP reviewer transport fails closed unless it can derive known, different
+families for `executor_model` and the **actual reviewer model**. The response
+includes `reviewer_model`, `reviewer_family`, `executor_model`,
+`executor_family`, and `independence_verified`. Prefer the provider-reported
+model id when available; if the configured HTTP provider internally switches to
+`LLM_FALLBACK_MODEL`, trace the model that actually served the review. Missing,
+unknown, ambiguous, or same-family identity is `REVIEW_UNAVAILABLE` for an
+acceptance gate.
+
+#### Configuration and privacy
+
+Example Claude Code registration:
+
+```bash
+claude mcp add llm-chat -s user \
+  --env LLM_API_KEY=<key> \
+  --env LLM_BASE_URL=https://example.com/v1 \
+  --env LLM_MODEL=gemini-2.5-pro \
+  --env LLM_REVIEW_FALLBACK_ENABLED=true \
+  -- python3 /path/to/mcp-servers/llm-chat/server.py
+```
+
+Restart Claude Code after changing MCP configuration. Enabling this fallback
+means the explicit primary artifacts passed in `files:` are sent to the
+configured third-party HTTP endpoint. Keep it disabled for repositories whose
+contents must not leave the machine/provider boundary.
+
+Trace the failed Codex attempt and the HTTP call separately. The verdict trace
+must name backend `llm-chat`, the actual returned reviewer model, its family,
+and the reason the safe fallback activated. If `mcp__llm-chat__review` is not
+available, its call fails, or cross-family identity cannot be verified, emit
+`REVIEW_UNAVAILABLE` (or `ERROR` for a mandatory gate) exactly as before.
+
 ### After upgrading codex-cli
 
 MCP servers are spawned per session: after upgrading codex-cli (e.g. to 0.144.1 for `ultra`/`max`), **restart the Claude Code session** so `codex mcp-server` runs the new binary — an old server process rejects the new effort enums even though the CLI on disk is new.
@@ -156,13 +275,13 @@ When the user explicitly passes `— reviewer: agy`, route the review through th
 Parse $ARGUMENTS for `— reviewer:` directive.
 
 If `— reviewer: agy`:
-    → Check if the gemini-review MCP tool is available (mcp__gemini_review__review).
+    → Check if the gemini-review MCP tool is available (mcp__gemini-review__review).
     → If available (server configured with GEMINI_REVIEW_BACKEND=agy):
-        Use mcp__gemini_review__review with:
+        Use mcp__gemini-review__review with:
           prompt: [same prompt you would send to Codex]
-        For round 2+: mcp__gemini_review__review_reply with the saved threadId.
+        For round 2+: mcp__gemini-review__review_reply with the saved threadId.
         For long paper/project reviews (avoid the ~120s MCP tool timeout):
-          mcp__gemini_review__review_start + mcp__gemini_review__review_status (async).
+          mcp__gemini-review__review_start + mcp__gemini-review__review_status (async).
     → If NOT available:
         Print: "⚠️ gemini-review (agy) MCP not configured. Falling back to Codex at this call's declared tier."
         Use mcp__codex__codex as normal.
@@ -187,9 +306,9 @@ claude mcp add gemini-review --env GEMINI_REVIEW_BACKEND=agy -- python3 <path>/m
 
 If the gemini-review (agy) MCP isn't configured, `— reviewer: agy` gracefully falls back to Codex at the call's declared tier (deep-audit: ultra / regular: xhigh). No error, no breakage, just a warning.
 
-## Optional: Manual Review (any model, zero API cost)
+## Optional: Manual Review (any classifiable model, zero API cost)
 
-When the user explicitly passes `— reviewer: manual`, route the review through the manual-review MCP server. Instead of calling an API, it opens a browser page (or writes a file on headless Linux) where the user copies the prompt to any model and pastes the response back.
+When the user explicitly passes `— reviewer: manual`, route the review through the manual-review MCP server. Instead of calling an API, it opens a browser page (or writes a file on headless Linux) where the user copies the prompt to a model of their choice and pastes the response back. The reviewer model must be one ARIS can classify by family (OpenAI, Anthropic, Google, DeepSeek, Moonshot/Kimi, Qwen); an unclassifiable name cannot be shown to differ from the executor's.
 
 **Zero API cost. Works with any text-capable model.**
 
@@ -219,7 +338,7 @@ If `— reviewer: manual`:
 ### Invariants
 
 - `— reviewer: manual` ONLY takes effect when explicitly passed
-- **Cross-model family is mandatory, not optional.** "any model" above means any *non-executor-family* model, determined dynamically from the actual executor model — not merely "non-Claude." Every verdict-bearing response must start with `Reviewer-Model: <exact-model-id>`; derive its family and compare it with the model-derived executor family. Missing, unknown, ambiguous, or same-family identity is `REVIEW_UNAVAILABLE` for an acceptance gate. The UI warning is advisory; the traced model identities and derivation are the gate.
+- **Cross-model family is mandatory, not optional.** "a model of their choice" above means any *classifiable, non-executor-family* model, determined dynamically from the actual executor model — not merely "non-Claude." Every verdict-bearing response must start with `Reviewer-Model: <exact-model-id>`; derive its family and compare it with the model-derived executor family. Missing, unknown, ambiguous, or same-family identity is `REVIEW_UNAVAILABLE` for an acceptance gate. The UI warning is advisory; the traced model identities and derivation are the gate.
 - Prompt fidelity: the review task text is exactly what Codex would receive; the manual transport wrapper may add only the model-identity response-format line used by the provenance gate
 - `config.model_reasoning_effort` is shown as a recommendation badge, not embedded in the prompt
 - Thread continuity: `review_reply` shows previous exchanges so the user can maintain context in their chosen model
